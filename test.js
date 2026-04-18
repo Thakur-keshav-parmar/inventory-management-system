@@ -1,9 +1,9 @@
 // ─── AWS CONFIGURATION ────────────────────────────────────────────────
         const AWS_CONFIG = {
             useCloud: false,
-            apiEndpoint: 'https://wzu3uazct6.execute-api.us-east-1.amazonaws.com/prod',
+            apiEndpoint: 'YOUR_API_GATEWAY_URL',
             apiBase: '',
-            razorpayKeyId: 'rzp_test_SLrxDpCa8ctwrN'
+            razorpayKeyId: 'YOUR_RAZORPAY_KEY_ID'
         };
 
         // ─── API INTEGRATION ──────────────────────────────────────────────────

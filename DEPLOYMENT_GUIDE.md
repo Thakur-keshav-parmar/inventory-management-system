@@ -91,7 +91,7 @@ cd "C:\Users\DRAGOO\OneDrive\Desktop\DEMO"
 aws cloudformation create-stack `
   --stack-name HardwarePro `
   --template-body file://infrastructure/template.yaml `
-  --parameters ParameterKey=RazorpayKeySecret,ParameterValue=Eccm72H7nyOm9UTyOkgBqhG1 `
+  --parameters ParameterKey=RazorpayKeySecret,ParameterValue=YOUR_RAZORPAY_KEY_SECRET `
   --capabilities CAPABILITY_NAMED_IAM `
   --region us-east-1
 ```

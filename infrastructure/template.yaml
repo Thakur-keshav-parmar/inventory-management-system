@@ -4,8 +4,8 @@ Description: 'HardwarePro POS - Complete AWS Infrastructure (Free Tier)'
 Parameters:
   RazorpayKeyId:
     Type: String
-    Default: 'rzp_test_SLrxDpCa8ctwrN'
-    Description: 'Razorpay Test Key ID'
+    Default: 'YOUR_RAZORPAY_KEY_ID'
+    Description: 'Razorpay Key ID from your Razorpay Dashboard > API Keys'
   RazorpayKeySecret:
     Type: String
     NoEcho: true

@@ -12,7 +12,7 @@ with open(input_path, "r", encoding="utf-8") as f:
 # 1. Add API Helpers and Loader State
 api_helpers = """
         // ─── API INTEGRATION ──────────────────────────────────────────────────
-        const API_BASE = window.AWS_CONFIG ? window.AWS_CONFIG.apiEndpoint : 'https://wzu3uazct6.execute-api.us-east-1.amazonaws.com/prod';
+        const API_BASE = window.AWS_CONFIG ? window.AWS_CONFIG.apiEndpoint : 'YOUR_API_GATEWAY_URL';
         
         async function apiGet(path) {
             try {
