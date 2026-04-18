@@ -4979,10 +4979,25 @@ We appreciate your business!`;
             const loader = document.getElementById('appLoader');
             if (loader) loader.style.display = 'flex';
 
+            // ── Auto-login bypass via URL: ?reset ──────────────────────────────
+            if (new URLSearchParams(window.location.search).has('reset')) {
+                users.length = 0;
+                users.push({ username: 'admin', phone: '9569723124', password: 'admin', role: 'admin' });
+                currentUser = users[0];
+                document.getElementById('loginScreen').style.display = 'none';
+                document.getElementById('loggedUserName').innerText = 'admin';
+                const av = document.getElementById('userAvatarInitials');
+                if (av) av.textContent = 'A';
+                setupUIForRole();
+                updateNotifications();
+                if (loader) loader.style.display = 'none';
+                return;
+            }
+
             // ── Seed local defaults (always available, no network needed) ──────
             const seedDefaults = () => {
                 if (users.length === 0) {
-                    users.push({ username: 'admin',    phone: '9999999999', password: '1234', role: 'admin' });
+                    users.push({ username: 'admin', phone: '9569723124', password: 'admin', role: 'admin' });
                     users.push({ username: 'staff',    phone: '8888888888', password: 'staff123', role: 'staff' });
                     users.push({ username: 'customer', phone: '7777777777', password: '123',      role: 'customer' });
                 }
