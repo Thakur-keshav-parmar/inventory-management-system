@@ -1,0 +1,116 @@
+# Full Database Connectivity — Implementation Plan
+
+Connect all HardwarePro POS data to AWS DynamoDB so nothing is lost on refresh.
+
+## What Changes
+
+Currently all data (products, users, bills, settings) lives only in browser memory.
+After this change, everything persists in DynamoDB and loads on every page refresh.
+
+---
+
+## Proposed Changes
+
+### AWS Infrastructure
+
+#### [MODIFY] [template.yaml](file:///C:/Users/DRAGOO/OneDrive/Desktop/DEMO/infrastructure/template.yaml)
+
+Add **4 new DynamoDB tables**:
+| Table | Primary Key | Stores |
+|---|---|---|
+| `HardwareProProducts` | `productId` (S) | Name, price, cost, stock, category, barcode, image |
+| `HardwareProUsers` | `username` (S) | Phone, password, role |
+| `HardwareProBills` | `billId` (S) | Items, customer, total, date, billedBy |
+| `HardwareProSettings` | `settingKey` (S) | Single item: store name, phone, address, tax rates |
+
+Add **4 new Lambda functions** (inline ZipFile code):
+| Lambda | HTTP Methods | Route |
+|---|---|---|
+| `ProductsFunction` | GET / POST / DELETE | `/products` |
+| `UsersFunction` | GET / POST / DELETE | `/users` |
+| `BillsFunction` | GET / POST | `/bills` |
+| `SettingsFunction` | GET / POST | `/settings` |
+
+Each Lambda handles CRUD using `@aws-sdk/client-dynamodb` (built into Node 18 runtime).
+
+Update IAM role to grant access to all 4 new tables.
+
+Deploy via:
+```powershell
+aws cloudformation update-stack `
+  --stack-name HardwarePro `
+  --template-body file://infrastructure/template.yaml `
+  --parameters ParameterKey=RazorpayKeySecret,ParameterValue=Eccm72H7nyOm9UTyOkgBqhG1 `
+  --capabilities CAPABILITY_NAMED_IAM `
+  --region us-east-1
+```
+
+---
+
+### Frontend
+
+#### [MODIFY] [index.html](file:///C:/Users/DRAGOO/OneDrive/Desktop/DEMO/index.html)
+
+Replace all in-memory data operations with API calls:
+
+**1. API helper layer** (new JS block at top):
+```javascript
+const API = AWS_CONFIG.apiEndpoint;
+async function apiGet(path) { ... }
+async function apiPost(path, body) { ... }
+async function apiDelete(path, body) { ... }
+```
+
+**2. App initialisation** — on page load, fetch all data:
+```javascript
+async function initApp() {
+  [products, users, transactions, storeSettings] = await Promise.all([
+    apiGet('/products'), apiGet('/users'),
+    apiGet('/bills'), apiGet('/settings')
+  ]);
+  // Seed defaults if first run
+}
+```
+
+**3. Product operations** (all become async):
+- `addItem()` → `apiPost('/products', item)` then refresh grid
+- `deleteItem(id)` → `apiDelete('/products', {productId: id})`
+- `updateStock()` → `apiPost('/products', updatedProduct)`
+- `applyBulkMarkup()` → batch POST each product
+
+**4. User operations**:
+- `addUser()` → `apiPost('/users', user)`
+- `deleteUser()` → `apiDelete('/users', {username})`
+
+**5. Bill/Transaction operations**:
+- `finalizeTransaction()` → `apiPost('/bills', billData)`
+- Logs tab → loaded from DynamoDB bills on tab open
+
+**6. Settings**:
+- `saveStoreSettings()` → `apiPost('/settings', settings)`
+- Loaded from DynamoDB on init
+
+**Loading UX**: Show a loading overlay while fetching initial data on page load.
+
+> [!IMPORTANT]
+> Product images are base64-encoded. Large images (>300KB) may exceed DynamoDB's 400KB item limit. The frontend will compress images to max 200px width before storing.
+
+---
+
+## Verification Plan
+
+### Automated (AWS CLI)
+After deployment, verify tables exist:
+```powershell
+& "C:\Program Files\Amazon\AWSCLIV2\aws.exe" dynamodb list-tables --region us-east-1 --no-cli-pager
+```
+Expected: all 5 table names in the output.
+
+### Manual Testing (Browser)
+Open **https://d2ng4b4wuwlw95.cloudfront.net** and:
+
+1. **Products persist**: Admin → Add a product → Refresh page → Product still shows ✅
+2. **Users persist**: Admin → Staff → Add user → Refresh → User still shows ✅
+3. **Bills persist**: Make a sale → Admin → Logs → Bill appears ✅
+4. **Settings persist**: Admin → Settings → Change store name → Refresh → Name still changed ✅
+5. **Payment flow**: Complete a Razorpay test payment → DynamoDB shows the transaction ✅

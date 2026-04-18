@@ -1,0 +1,1435 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'HardwarePro POS - Complete AWS Infrastructure (Free Tier)'
+
+Parameters:
+  RazorpayKeyId:
+    Type: String
+    Default: 'rzp_test_SLrxDpCa8ctwrN'
+    Description: 'Razorpay Test Key ID'
+  RazorpayKeySecret:
+    Type: String
+    NoEcho: true
+    Description: 'Razorpay Test Key Secret (kept server-side only)'
+  TwilioAccountSid:
+    Type: String
+    Default: 'ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+    Description: 'Twilio Account SID (for WhatsApp e-bill)'
+  TwilioAuthToken:
+    Type: String
+    NoEcho: true
+    Default: 'your_twilio_auth_token'
+    Description: 'Twilio Auth Token'
+  TwilioWhatsAppFrom:
+    Type: String
+    Default: 'whatsapp:+14155238886'
+    Description: 'Twilio WhatsApp sender number (sandbox: whatsapp:+14155238886)'
+
+Resources:
+
+  # ????????? DYNAMODB TABLE ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProTransactions
+      BillingMode: PAY_PER_REQUEST        # Free tier: 25 GB, 25 WCU/RCU free
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+
+  # ????????? IAM ROLE (Least Privilege) ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HardwarePro-Lambda-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt TransactionsTable.Arn
+
+  # ????????? LAMBDA: CREATE ORDER ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  CreateOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-CreateOrder
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          KEY_ID: !Ref RazorpayKeyId
+          KEY_SECRET: !Ref RazorpayKeySecret
+      Code:
+        ZipFile: |
+          const https=require('https');
+          exports.handler=async(event)=>{
+            const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'POST,OPTIONS','Content-Type':'application/json'};
+            if(event.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              const b=JSON.parse(event.body||'{}');
+              const paise=Math.round((b.amount||0)*100);
+              const creds=Buffer.from(process.env.KEY_ID+':'+process.env.KEY_SECRET).toString('base64');
+              const pd=JSON.stringify({amount:paise,currency:'INR',receipt:b.receipt||'r'+Date.now()});
+              const order=await new Promise((res,rej)=>{
+                const req=https.request({hostname:'api.razorpay.com',path:'/v1/orders',method:'POST',
+                  headers:{'Content-Type':'application/json','Authorization':'Basic '+creds,'Content-Length':Buffer.byteLength(pd)}},(r)=>{
+                  let d='';r.on('data',c=>d+=c);r.on('end',()=>res(JSON.parse(d)));
+                });
+                req.on('error',rej);req.write(pd);req.end();
+              });
+              return{statusCode:200,headers:h,body:JSON.stringify({orderId:order.id,amount:order.amount,currency:order.currency})};
+            }catch(e){return{statusCode:500,headers:h,body:JSON.stringify({error:e.message})};}
+          };
+
+  # ????????? LAMBDA: CONFIRM PAYMENT ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  ConfirmPaymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-ConfirmPayment
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          KEY_SECRET: !Ref RazorpayKeySecret
+          TABLE_NAME: !Ref TransactionsTable
+      Code:
+        ZipFile: |
+          const crypto=require('crypto');
+          const {DynamoDBClient,PutItemCommand}=require('@aws-sdk/client-dynamodb');
+          const db=new DynamoDBClient({});
+          exports.handler=async(event)=>{
+            const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'POST,OPTIONS','Content-Type':'application/json'};
+            if(event.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              const b=JSON.parse(event.body||'{}');
+              const sig=crypto.createHmac('sha256',process.env.KEY_SECRET).update(b.razorpay_order_id+'|'+b.razorpay_payment_id).digest('hex');
+              if(sig!==b.razorpay_signature)return{statusCode:400,headers:h,body:JSON.stringify({success:false,error:'Invalid signature'})};
+              await db.send(new PutItemCommand({TableName:process.env.TABLE_NAME,Item:{
+                transactionId:{S:b.transactionId||'tx'+Date.now()},
+                userId:{S:b.userId||'guest'},
+                amount:{N:String(b.amount||0)},
+                status:{S:'captured'},
+                timestamp:{S:new Date().toISOString()},
+                razorpayOrderId:{S:b.razorpay_order_id},
+                razorpayPaymentId:{S:b.razorpay_payment_id}
+              }}));
+              return{statusCode:200,headers:h,body:JSON.stringify({success:true,transactionId:b.transactionId,paymentId:b.razorpay_payment_id})};
+            }catch(e){return{statusCode:500,headers:h,body:JSON.stringify({success:false,error:e.message})};}
+          };
+
+  # ????????? API GATEWAY ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  HardwareProApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: HardwarePro-API
+      Description: HardwarePro Payment API
+
+  CreateOrderResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: create-order
+
+  CreateOrderPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref CreateOrderResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateOrderFunction.Arn}/invocations'
+
+  CreateOrderOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref CreateOrderResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ConfirmPaymentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: confirm-payment
+
+  ConfirmPaymentPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ConfirmPaymentResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConfirmPaymentFunction.Arn}/invocations'
+
+  ConfirmPaymentOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ConfirmPaymentResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  CreateOrderPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateOrderFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/POST/create-order'
+
+  ConfirmPaymentPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConfirmPaymentFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/POST/confirm-payment'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateOrderPost
+      - CreateOrderOptions
+      - ConfirmPaymentPost
+      - ConfirmPaymentOptions
+    Properties:
+      RestApiId: !Ref HardwareProApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      DeploymentId: !Ref ApiDeploymentV2
+      StageName: prod
+
+  # ????????? S3 BUCKET (Static Website Hosting) ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hardwarepro-frontend-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # ????????? CLOUDFRONT DISTRIBUTION ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: FrontendBucket
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: HardwarePro Frontend
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3WebsiteOrigin
+            DomainName: !Select
+              - 1
+              - !Split ['://', !GetAtt FrontendBucket.WebsiteURL]
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3WebsiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD]
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+# ????????? OUTPUTS ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+  # ????????? DYNAMODB: NEW TABLES ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProProducts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProUsers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+
+  BillsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProBills
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: billId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: billId
+          KeyType: HASH
+
+  SettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProSettings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: settingKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: settingKey
+          KeyType: HASH
+
+  # ????????? IAM: GRANT LAMBDA ACCESS TO ALL NEW TABLES ??????????????????????????????????????????????????????????????????????????????
+  LambdaNewTablesPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: HardwarePro-NewTables-Policy
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Scan
+              - dynamodb:Query
+            Resource:
+              - !GetAtt ProductsTable.Arn
+              - !GetAtt UsersTable.Arn
+              - !GetAtt BillsTable.Arn
+              - !GetAtt SettingsTable.Arn
+
+  # ????????? LAMBDA: PRODUCTS CRUD ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  ProductsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Products
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProductsTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,ScanCommand,PutItemCommand,DeleteItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new ScanCommand({TableName:T}));return{statusCode:200,headers:h,body:JSON.stringify(r.Items.map(i=>unmarshall(i)))};}
+              if(e.httpMethod==='POST'){const item=JSON.parse(e.body);await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+              if(e.httpMethod==='DELETE'){const b=JSON.parse(e.body);await db.send(new DeleteItemCommand({TableName:T,Key:{productId:{S:b.productId}}}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ????????? LAMBDA: USERS CRUD ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  UsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Users
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UsersTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,ScanCommand,PutItemCommand,DeleteItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new ScanCommand({TableName:T}));return{statusCode:200,headers:h,body:JSON.stringify(r.Items.map(i=>unmarshall(i)))};}
+              if(e.httpMethod==='POST'){const item=JSON.parse(e.body);await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+              if(e.httpMethod==='DELETE'){const b=JSON.parse(e.body);await db.send(new DeleteItemCommand({TableName:T,Key:{username:{S:b.username}}}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ????????? LAMBDA: BILLS CRUD ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  BillsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Bills
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BillsTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,ScanCommand,PutItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new ScanCommand({TableName:T}));return{statusCode:200,headers:h,body:JSON.stringify(r.Items.map(i=>unmarshall(i)))};}
+              if(e.httpMethod==='POST'){const item=JSON.parse(e.body);await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ????????? LAMBDA: SETTINGS CRUD ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  SettingsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Settings
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SettingsTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,GetItemCommand,PutItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new GetItemCommand({TableName:T,Key:{settingKey:{S:'store'}}}));return{statusCode:200,headers:h,body:JSON.stringify(r.Item?unmarshall(r.Item):{settingKey:'store'})};}
+              if(e.httpMethod==='POST'){const item={...JSON.parse(e.body),settingKey:'store'};await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ????????? API GATEWAY: /products ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  ProductsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: products
+
+  ProductsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsFunction.Arn}/invocations'
+
+  ProductsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsFunction.Arn}/invocations'
+
+  ProductsDelete:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsFunction.Arn}/invocations'
+
+  ProductsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ????????? API GATEWAY: /users ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: users
+
+  UsersGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersDelete:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ????????? API GATEWAY: /bills ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  BillsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: bills
+
+  BillsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref BillsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BillsFunction.Arn}/invocations'
+
+  BillsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref BillsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BillsFunction.Arn}/invocations'
+
+  BillsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref BillsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ????????? API GATEWAY: /settings ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  SettingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: settings
+
+  SettingsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref SettingsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SettingsFunction.Arn}/invocations'
+
+  SettingsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref SettingsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SettingsFunction.Arn}/invocations'
+
+  SettingsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref SettingsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ????????? LAMBDA PERMISSIONS ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  ProductsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProductsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  UsersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  BillsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BillsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  SettingsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SettingsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  # ── LAMBDA: SEND WHATSAPP E-BILL ────────────────────────────────────────────
+  SendWhatsAppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-SendWhatsApp
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TWILIO_SID:   !Ref TwilioAccountSid
+          TWILIO_TOKEN: !Ref TwilioAuthToken
+          TWILIO_FROM:  !Ref TwilioWhatsAppFrom
+      Code:
+        ZipFile: |
+          const https=require('https');
+          const CORS={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'POST,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(event)=>{
+            if(event.httpMethod==='OPTIONS')return{statusCode:200,headers:CORS,body:''};
+            try{
+              const{phone,message}=JSON.parse(event.body||'{}');
+              if(!phone||!message)return{statusCode:400,headers:CORS,body:JSON.stringify({success:false,error:'phone and message required'})};
+              let e164=phone.replace(/\D/g,'');
+              if(e164.length===10)e164='91'+e164;
+              if(!e164.startsWith('+'))e164='+'+e164;
+              const SID=process.env.TWILIO_SID,TOKEN=process.env.TWILIO_TOKEN,FROM=process.env.TWILIO_FROM;
+              const pd=new URLSearchParams({To:'whatsapp:'+e164,From:FROM,Body:message}).toString();
+              const creds=Buffer.from(SID+':'+TOKEN).toString('base64');
+              const r=await new Promise((res,rej)=>{
+                const req=https.request({hostname:'api.twilio.com',path:`/2010-04-01/Accounts/${SID}/Messages.json`,method:'POST',
+                  headers:{'Content-Type':'application/x-www-form-urlencoded','Authorization':'Basic '+creds,'Content-Length':Buffer.byteLength(pd)}},(resp)=>{
+                  let d='';resp.on('data',c=>d+=c);resp.on('end',()=>res({status:resp.statusCode,body:d}));
+                });
+                req.on('error',rej);req.write(pd);req.end();
+              });
+              const tr=JSON.parse(r.body);
+              if(r.status===201)return{statusCode:200,headers:CORS,body:JSON.stringify({success:true,sid:tr.sid})};
+              return{statusCode:502,headers:CORS,body:JSON.stringify({success:false,error:tr.message||'Twilio error'})};
+            }catch(e){return{statusCode:500,headers:CORS,body:JSON.stringify({success:false,error:e.message})};}
+          };
+
+  # ── API GATEWAY: /whatsapp ───────────────────────────────────────────────────
+  WhatsAppResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: whatsapp
+
+  WhatsAppPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref WhatsAppResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendWhatsAppFunction.Arn}/invocations'
+
+  WhatsAppOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref WhatsAppResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SendWhatsAppPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendWhatsAppFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  # ── NEW DEPLOYMENT (includes all new routes) ─────────────────────────────
+  ApiDeploymentV2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProductsGet
+      - ProductsPost
+      - ProductsDelete
+      - ProductsOptions
+      - UsersGet
+      - UsersPost
+      - UsersDelete
+      - UsersOptions
+      - BillsGet
+      - BillsPost
+      - BillsOptions
+      - SettingsGet
+      - SettingsPost
+      - SettingsOptions
+    Properties:
+      RestApiId: !Ref HardwareProApi
+
+
+  # ─── DYNAMODB: NEW TABLES ─────────────────────────────────────────────────
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProProducts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProUsers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+
+  BillsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProBills
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: billId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: billId
+          KeyType: HASH
+
+  SettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: HardwareProSettings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: settingKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: settingKey
+          KeyType: HASH
+
+  # ─── IAM: GRANT LAMBDA ACCESS TO ALL NEW TABLES ──────────────────────────
+  LambdaNewTablesPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: HardwarePro-NewTables-Policy
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Scan
+              - dynamodb:Query
+            Resource:
+              - !GetAtt ProductsTable.Arn
+              - !GetAtt UsersTable.Arn
+              - !GetAtt BillsTable.Arn
+              - !GetAtt SettingsTable.Arn
+
+  # ─── LAMBDA: PRODUCTS CRUD ────────────────────────────────────────────────
+  ProductsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Products
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProductsTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,ScanCommand,PutItemCommand,DeleteItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new ScanCommand({TableName:T}));return{statusCode:200,headers:h,body:JSON.stringify(r.Items.map(i=>unmarshall(i)))};}
+              if(e.httpMethod==='POST'){const item=JSON.parse(e.body);await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+              if(e.httpMethod==='DELETE'){const b=JSON.parse(e.body);await db.send(new DeleteItemCommand({TableName:T,Key:{productId:{S:b.productId}}}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ─── LAMBDA: USERS CRUD ───────────────────────────────────────────────────
+  UsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Users
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UsersTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,ScanCommand,PutItemCommand,DeleteItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new ScanCommand({TableName:T}));return{statusCode:200,headers:h,body:JSON.stringify(r.Items.map(i=>unmarshall(i)))};}
+              if(e.httpMethod==='POST'){const item=JSON.parse(e.body);await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+              if(e.httpMethod==='DELETE'){const b=JSON.parse(e.body);await db.send(new DeleteItemCommand({TableName:T,Key:{username:{S:b.username}}}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ─── LAMBDA: BILLS CRUD ───────────────────────────────────────────────────
+  BillsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Bills
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BillsTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,ScanCommand,PutItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new ScanCommand({TableName:T}));return{statusCode:200,headers:h,body:JSON.stringify(r.Items.map(i=>unmarshall(i)))};}
+              if(e.httpMethod==='POST'){const item=JSON.parse(e.body);await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ─── LAMBDA: SETTINGS CRUD ────────────────────────────────────────────────
+  SettingsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HardwarePro-Settings
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SettingsTable
+      Code:
+        ZipFile: |
+          const {DynamoDBClient,GetItemCommand,PutItemCommand}=require('@aws-sdk/client-dynamodb');
+          const {marshall,unmarshall}=require('@aws-sdk/util-dynamodb');
+          const db=new DynamoDBClient({});const T=process.env.TABLE_NAME;
+          const h={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Content-Type':'application/json'};
+          exports.handler=async(e)=>{
+            if(e.httpMethod==='OPTIONS')return{statusCode:200,headers:h,body:''};
+            try{
+              if(e.httpMethod==='GET'){const r=await db.send(new GetItemCommand({TableName:T,Key:{settingKey:{S:'store'}}}));return{statusCode:200,headers:h,body:JSON.stringify(r.Item?unmarshall(r.Item):{settingKey:'store'})};}
+              if(e.httpMethod==='POST'){const item={...JSON.parse(e.body),settingKey:'store'};await db.send(new PutItemCommand({TableName:T,Item:marshall(item,{removeUndefinedValues:true})}));return{statusCode:200,headers:h,body:JSON.stringify({success:true})};}
+            }catch(err){return{statusCode:500,headers:h,body:JSON.stringify({error:err.message})};}
+          };
+
+  # ─── API GATEWAY: /products ───────────────────────────────────────────────
+  ProductsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: products
+
+  ProductsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsFunction.Arn}/invocations'
+
+  ProductsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsFunction.Arn}/invocations'
+
+  ProductsDelete:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsFunction.Arn}/invocations'
+
+  ProductsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ─── API GATEWAY: /users ──────────────────────────────────────────────────
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: users
+
+  UsersGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersDelete:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ─── API GATEWAY: /bills ──────────────────────────────────────────────────
+  BillsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: bills
+
+  BillsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref BillsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BillsFunction.Arn}/invocations'
+
+  BillsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref BillsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BillsFunction.Arn}/invocations'
+
+  BillsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref BillsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ─── API GATEWAY: /settings ───────────────────────────────────────────────
+  SettingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ParentId: !GetAtt HardwareProApi.RootResourceId
+      PathPart: settings
+
+  SettingsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref SettingsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SettingsFunction.Arn}/invocations'
+
+  SettingsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref SettingsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SettingsFunction.Arn}/invocations'
+
+  SettingsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HardwareProApi
+      ResourceId: !Ref SettingsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ─── LAMBDA PERMISSIONS ────────────────────────────────────────────────────
+  ProductsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProductsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  UsersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  BillsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BillsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  SettingsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SettingsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HardwareProApi}/*/*/*'
+
+  # ─── NEW DEPLOYMENT (includes all new routes) ─────────────────────────────
+  ApiDeploymentV2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProductsGet
+      - ProductsPost
+      - ProductsDelete
+      - ProductsOptions
+      - UsersGet
+      - UsersPost
+      - UsersDelete
+      - UsersOptions
+      - BillsGet
+      - BillsPost
+      - BillsOptions
+      - SettingsGet
+      - SettingsPost
+      - SettingsOptions
+      - WhatsAppPost
+      - WhatsAppOptions
+    Properties:
+      RestApiId: !Ref HardwareProApi
+
+Outputs:
+  ApiEndpoint:
+    Description: 'Paste this URL into index.html as YOUR_API_GATEWAY_URL'
+    Value: !Sub 'https://${HardwareProApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  S3BucketName:
+    Description: 'Upload index.html to this S3 bucket'
+    Value: !Ref FrontendBucket
+
+  CloudFrontURL:
+    Description: 'Your live website URL (after uploading index.html to S3)'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  DynamoDBTable:
+    Description: 'DynamoDB table storing all payment transactions'
+    Value: !Ref TransactionsTable

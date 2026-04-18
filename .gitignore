@@ -1,0 +1,16 @@
+# AWS credentials - NEVER commit these
+__AWS KEYS/
+*.csv
+*.pem
+*.key
+
+# Claude AI session data
+.claude/
+
+# Sensitive config files
+config.js
+secrets.json
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,32 @@
+{
+  "note": "Replace all YOUR_* placeholders with your actual AWS values after deploying the CloudFormation stack.",
+  "Stacks": [
+    {
+      "StackName": "HardwarePro",
+      "Description": "HardwarePro POS - Complete AWS Infrastructure (Free Tier)",
+      "StackStatus": "UPDATE_COMPLETE",
+      "Outputs": [
+        {
+          "OutputKey": "CloudFrontURL",
+          "OutputValue": "https://YOUR_CLOUDFRONT_ID.cloudfront.net",
+          "Description": "Your live website URL"
+        },
+        {
+          "OutputKey": "ApiEndpoint",
+          "OutputValue": "https://YOUR_API_ID.execute-api.us-east-1.amazonaws.com/prod",
+          "Description": "Paste into index.html AWS_CONFIG.apiEndpoint"
+        },
+        {
+          "OutputKey": "S3BucketName",
+          "OutputValue": "your-frontend-bucket-name",
+          "Description": "Upload index.html to this S3 bucket"
+        },
+        {
+          "OutputKey": "DynamoDBTable",
+          "OutputValue": "HardwareProTransactions",
+          "Description": "DynamoDB table for transactions"
+        }
+      ]
+    }
+  ]
+}
